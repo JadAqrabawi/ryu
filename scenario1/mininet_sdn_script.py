@@ -9,14 +9,13 @@ import re
 import time
 import os
 
-# Configuration
-RYU_CONTROLLER_IP = "10.0.0.3"   # Update to your controller IP
+RYU_CONTROLLER_IP = "10.0.0.3"  # your Ryu controller IP
 RYU_CONTROLLER_PORT = 6633
-ATTACK_GENERATOR_SCRIPT = "/root/attack_generator.py"  # path inside attacker
 NUM_RUNS = 3
 PING_COUNT = 15
 PING_INTERVAL = 0.5
 CSV_LOG = "scenario1_integrated_metrics.csv"
+ATTACK_SCRIPT_PATH = "/root/attack_generator.sh"  # Path inside attacker node
 
 AP_GATEWAYS = {
     'sta1': '10.0.1.254',
@@ -30,7 +29,6 @@ AP_GATEWAYS = {
     'sta9': '10.0.3.254',
     'sta10': '10.0.3.254'
 }
-
 CLIENTS = list(AP_GATEWAYS.keys())
 
 def parse_ping_output(ping_output):
@@ -65,7 +63,6 @@ def start_mininet():
     sta9 = net.addStation('sta9', ip='10.0.3.2/24', position='255,70,0')
     sta10 = net.addStation('sta10', ip='10.0.3.3/24', position='250,80,0')
 
-    # Attacker in AP1 subnet
     attacker = net.addStation('attacker', ip='10.0.1.100/24',
                              mac='00:11:22:33:44:55', position='35,60,0')
 
@@ -120,7 +117,7 @@ def run_ping_phase(net, phase, results):
 def run_attack(net):
     attacker = net.get('attacker')
     info("Starting attack generator inside attacker node...\n")
-    attacker.cmd(f'python3 {ATTACK_GENERATOR_SCRIPT} &')
+    attacker.cmd(f'{ATTACK_SCRIPT_PATH} &')
 
 def write_results_to_csv(run_id, results):
     file_exists = os.path.isfile(CSV_LOG)
@@ -166,8 +163,7 @@ def main():
 
     info("All test runs completed.\n")
 
-    # Start interactive Mininet CLI for manual tests and debugging
-    CLI(net)
+    CLI(net)  # Start Mininet CLI for manual interaction
 
     net.stop()
 

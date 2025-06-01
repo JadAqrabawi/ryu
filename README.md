@@ -1,13 +1,12 @@
 sudo systemctl restart NetworkManager
 
+chmod +x attack_generator.sh
+
+RYU_LOG_LEVEL=INFO ryu-manager ryu_controller.py
+
 ryu-manager ryu_controller.py
 
 sudo python3 mininet_sdn_script.py --controller=remote,ip=<10.0.0.1>,port=6633
-
-
-Sure! Here’s a simple **README / run instructions** you can include with your project. It covers setting up, running the experiments, and using the Mininet CLI for manual checks.
-
----
 
 # README: SDN Wi-Fi De-auth Attack Mitigation Experiment
 
