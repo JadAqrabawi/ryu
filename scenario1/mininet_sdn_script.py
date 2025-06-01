@@ -1,116 +1,86 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
+
 """
-Scenario 1 – three APs, nine stations, 20-s wired-link outage on ap2
+Mininet-WiFi topology for Scenario 1 with attacker node:
+- 3 APs (AP1, AP2, AP3)
+- 10 stations (clients)
+- 1 attacker station connected to AP1
+- Fixed IPs and association as per scenario 1
+- Remote Ryu controller at 127.0.0.1:6633
 """
 
-import os, time, threading, random, csv
-from mininet.node  import RemoteController, OVSSwitch
-from mininet.link  import TCLink
-from mininet.log   import setLogLevel, info
-from mn_wifi.net   import Mininet_wifi
-from mn_wifi.node  import OVSKernelAP
-from mn_wifi.cli   import CLI
-from mn_wifi.link  import wmediumd
-from mn_wifi.wmediumdConnector import interference
-setLogLevel('info')
+from mininet.wifi.net import Mininet_wifi
+from mininet.node import RemoteController, OVSKernelAP
+from mininet.cli import CLI
+from mininet.log import setLogLevel, info
 
-# results folder
-RESULTS_DIR = os.path.dirname(os.path.abspath(__file__))
-RUN_LOG = os.path.join(RESULTS_DIR, "scenario1_runs.csv")
 
-def record(row: dict):
-    hdr = not os.path.exists(RUN_LOG)
-    with open(RUN_LOG, "a", newline="") as f:
-        w = csv.writer(f)
-        if hdr:
-            w.writerow(row.keys())
-        w.writerow(row.values())
+def scenario1_topology():
+    net = Mininet_wifi(controller=RemoteController, accessPoint=OVSKernelAP)
 
-# ───── topology ─────
-def build():
-    net = Mininet_wifi(controller=RemoteController,
-                       link=TCLink,
-                       accessPoint=OVSKernelAP,
-                       switch=OVSSwitch,
-                       wmediumd_mode=interference)
+    info("*** Creating Access Points\n")
+    ap1 = net.addAccessPoint('ap1', ssid='ssid_ap1', mode='g', channel='1', position='50,50,0', ip='10.0.1.254/24')
+    ap2 = net.addAccessPoint('ap2', ssid='ssid_ap2', mode='g', channel='6', position='150,50,0', ip='10.0.2.254/24')
+    ap3 = net.addAccessPoint('ap3', ssid='ssid_ap3', mode='g', channel='11', position='250,50,0', ip='10.0.3.254/24')
 
-    net.addController("c0", ip="127.0.0.1", port=6653)
-    s1 = net.addSwitch("s1")
+    info("*** Creating Stations\n")
+    # AP1 clients
+    sta1 = net.addStation('sta1', ip='10.0.1.1/24', position='45,70,0')
+    sta2 = net.addStation('sta2', ip='10.0.1.2/24', position='55,70,0')
+    sta3 = net.addStation('sta3', ip='10.0.1.3/24', position='40,80,0')
+    sta4 = net.addStation('sta4', ip='10.0.1.4/24', position='60,80,0')
 
-    aps = {}
-    for name, pos, ch in (("ap1", "10,30,0", "1"),
-                          ("ap2", "30,30,0", "6"),
-                          ("ap3", "50,30,0", "11")):
-        ap = net.addAccessPoint(name, ssid=f"ssid-{name}",
-                                mode="g", channel=ch,
-                                position=pos)
-        ap.params["position"] = pos
-        ap.lastpos            = pos
-        ap.wmIfaces           = []
-        aps[name] = ap
+    # AP2 clients
+    sta5 = net.addStation('sta5', ip='10.0.2.1/24', position='145,70,0')
+    sta6 = net.addStation('sta6', ip='10.0.2.2/24', position='155,70,0')
+    sta7 = net.addStation('sta7', ip='10.0.2.3/24', position='150,80,0')
 
-    gw = net.addHost("gw", ip="10.0.0.254/24")
+    # AP3 clients
+    sta8 = net.addStation('sta8', ip='10.0.3.1/24', position='245,70,0')
+    sta9 = net.addStation('sta9', ip='10.0.3.2/24', position='255,70,0')
+    sta10 = net.addStation('sta10', ip='10.0.3.3/24', position='250,80,0')
 
-    stations = []
-    for i in range(1, 10):
-        pos = f"{5*i},10,0"
-        sta = net.addStation(f"sta{i}", ip=f"10.0.0.{i}/24",
-                             position=pos)
-        sta.params["position"] = pos
-        sta.lastpos            = pos
-        sta.wmIfaces           = []
-        stations.append(sta)
+    # Attacker station
+    attacker = net.addStation('attacker', ip='192.168.0.100/24', mac='00:11:22:33:44:55', position='35,60,0')
 
-    net.setPropagationModel(model="logDistance", exp=4)
+    info("*** Adding Controller\n")
+    c0 = net.addController('c0', controller=RemoteController, ip='10.0.0.3', port=6633)
+
+    info("*** Configuring Wifi nodes\n")
     net.configureWifiNodes()
 
-    for ap in aps.values():
-        net.addLink(ap, s1, bw=100)
+    info("*** Associating Stations to APs\n")
+    # Link AP1 clients and attacker
+    net.addLink(ap1, sta1)
+    net.addLink(ap1, sta2)
+    net.addLink(ap1, sta3)
+    net.addLink(ap1, sta4)
+    net.addLink(ap1, attacker)
 
-    # gateway now hangs off ap1 (same L2 domain as stations)
-    net.addLink(gw, aps["ap1"], bw=100)
+    # AP2 clients
+    net.addLink(ap2, sta5)
+    net.addLink(ap2, sta6)
+    net.addLink(ap2, sta7)
 
-    return net, aps, stations
+    # AP3 clients
+    net.addLink(ap3, sta8)
+    net.addLink(ap3, sta9)
+    net.addLink(ap3, sta10)
 
-# helpers
-def start_pings(stations, dst="10.0.0.254"):
-    for sta in stations:
-        sta.cmd(f"ping -i 0.5 {dst} &")
-
-def outage(net, ap2):
-    info("*** waiting 30 s – then bring ap2-s1 link DOWN for 20 s\n")
-    time.sleep(30)
-    if ap2.name in net.nameToNode:
-        net.configLinkStatus(ap2, "s1", "down")
-        info("*** link down\n")
-    else:
-        info("*** ap2 not found in net\n")
-    time.sleep(20)
-    if ap2.name in net.nameToNode:
-        net.configLinkStatus(ap2, "s1", "up")
-        info("*** link restored\n")
-    else:
-        info("*** ap2 not found in net\n")
-
-# main
-def run():
-    net, aps, stations = build()
-    info("*** build & start\n")
+    info("*** Starting Network\n")
     net.build()
-    net.start()
+    c0.start()
+    ap1.start([c0])
+    ap2.start([c0])
+    ap3.start([c0])
 
-    start_pings(stations)
-
-    threading.Thread(target=outage,
-                     args=(net, aps["ap2"]), daemon=True).start()
-
-    record({ "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-             "run_id"   : random.randint(10000, 99999),
-             "scenario" : "1",
-             "note"     : "ap2 wired link down 20 s" })
-
+    info("*** Running CLI\n")
     CLI(net)
+
+    info("*** Stopping Network\n")
     net.stop()
 
-if __name__ == "__main__":
-    run()
+
+if __name__ == '__main__':
+    setLogLevel('info')
+    scenario1_topology()

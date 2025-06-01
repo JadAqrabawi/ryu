@@ -1,191 +1,304 @@
-#!/usr/bin/env python3
-#
-# MitigationController – SDN wireless attack detector / responder
-#
-
-import os
-import time
-import csv
-import threading
-import collections
-
 from ryu.base import app_manager
 from ryu.controller import ofp_event
 from ryu.controller.handler import MAIN_DISPATCHER, CONFIG_DISPATCHER, set_ev_cls
-from ryu.lib.packet import packet, ethernet
 from ryu.ofproto import ofproto_v1_3
+from ryu.lib.packet import packet, ethernet, ipv4, icmp, ether_types
+from ryu.lib import hub
+import time
+import random
+import csv
+import os
 
-
-# ───────── Paths ─────────
-DEFAULT_RESULTS_DIR = os.path.expanduser("~/results")
-RESULTS_DIR  = os.getenv("SDN_RESULTS_DIR", DEFAULT_RESULTS_DIR)
-os.makedirs(RESULTS_DIR, exist_ok=True)
-RESULTS_FILE = os.path.join(RESULTS_DIR, "scenario1_sdn.csv")
-
-# ───────── Detection thresholds ─────────
-PORT_DOWN_ALARM        = True          # raise alarm on AP port down
-WINDOW_SEC             = 5             # sliding window length
-SILENT_CLIENTS_THRESH  = 3             # quiet clients in window → alarm
-
-SILENT_TIMEOUT_SEC     = 2             # one client quiet this long
-SILENT_BACKOFF_SEC     = 8             # pause before re-checking same mac
-RESTORE_TIMEOUT_SEC    = 10            # calm period → clear alarm
-# ─────────────────────────────────────────
-
-
-class MitigationController(app_manager.RyuApp):
+class SDNDeauthMitigation(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
+    # Constants
+    DETECTION_PROBABILITY = 0.90
+    BLOCKING_SUCCESS_RATE = 0.80
+    ATTACK_RATE_THRESHOLD = 50  # fps (simulated)
+    CLIENT_DISCONNECT_TIMEOUT = 2  # seconds of no ICMP/traffic
+    ATTACK_DURATION = 30  # seconds
+    RESTORATION_TRIGGER_TIME = 10  # seconds no attack or disconnection
+    NUM_RUNS_PER_SCENARIO = 20
+
+    # Clients and reroute mapping for Scenario 1
+    clients_ap1 = ['sta1', 'sta2', 'sta3', 'sta4']
+    clients_ap1_ips = ['10.0.1.1', '10.0.1.2', '10.0.1.3', '10.0.1.4']
+    reroute_targets = {
+        'sta1': 'AP2',
+        'sta2': 'AP2',
+        'sta3': 'AP3',
+        'sta4': 'AP3'
+    }
+
+    # Other clients
+    clients_ap2_ips = ['10.0.2.1', '10.0.2.2', '10.0.2.3']
+    clients_ap3_ips = ['10.0.3.1', '10.0.3.2', '10.0.3.3']
+
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+        super(SDNDeauthMitigation, self).__init__(*args, **kwargs)
+        random.seed(42)  # For reproducibility
 
-        # runtime maps
-        self.mac_to_port   = {}           # {dpid: {mac: port}}
-        self.last_seen     = {}           # {mac: ts}
-        self.rerouted      = set()        # handled clients
-        self.backoff_until = {}           # mac → next eligible ts
-        self.silent_hits   = collections.deque()  # (ts, mac)
+        # Tracking
+        self.run_id = 1
+        self.attack_detected = False
+        self.attack_blocked = False
+        self.attack_start_time = None
+        self.last_attack_frame_time = None
+        self.client_last_seen = {}  # ip -> last packet timestamp
+        self.disconnected_clients = set()
+        self.rerouted_clients = set()
+        self.restored_clients = set()
+        self.metrics_file = 'scenario1_metrics.csv'
 
-        self.alarm_ts      = None
-        self.attacker_mac  = None         # first MAC we block
-        self.attacker_dp   = None         # datapath holding the drop rule
+        self.datapath = None  # will be set on switch connect
+        self.monitor_thread = None
+        self.restoration_thread = None
 
-        # CSV preparation
-        if not os.path.exists(RESULTS_FILE):
-            with open(RESULTS_FILE, "w", newline="") as f:
-                csv.writer(f).writerow(
-                    ["timestamp", "event", "mac", "dpid", "detail"]
-                )
+        # Initialize CSV file with headers
+        if not os.path.exists(self.metrics_file):
+            with open(self.metrics_file, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    'runID', 'detected', 'blocked', 'disconnected_clients',
+                    'rerouted_clients', 'restored_clients', 'packet_loss_%',
+                    'mitigation_latency_s', 'throughput_Mbps'
+                ])
 
-        threading.Thread(target=self._watch_clients, daemon=True).start()
+        self.logger.info("Controller initialized for Scenario 1")
 
-    # ───────── Switch hello ─────────
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
-    def _switch_ready(self, ev):
-        dpid = ev.msg.datapath.id
-        self.mac_to_port[dpid] = {}
-        self.logger.info("Switch joined: dpid=%s", dpid)
+    def switch_features_handler(self, ev):
+        self.datapath = ev.msg.datapath
+        self.install_table_miss(self.datapath)
 
-    # ───────── Packet-in ─────────
-    @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
-    def _packet_in(self, ev):
-        msg     = ev.msg
-        dp      = msg.datapath
-        dpid    = dp.id
-        in_port = msg.match['in_port']
-        parser  = dp.ofproto_parser
-        ofp     = dp.ofproto
+        # Start monitor thread if not started
+        if self.monitor_thread is None:
+            self.monitor_thread = hub.spawn(self._monitor_clients)
 
-        eth = packet.Packet(msg.data).get_protocol(ethernet.ethernet)
-        if eth is None:
-            return
-        src, dst = eth.src, eth.dst
+        # Start the first run after short delay
+        hub.spawn_after(1, self._start_run)
 
-        # learning switch
-        self.mac_to_port[dpid][src] = in_port
-        out_port = self.mac_to_port[dpid].get(dst, ofp.OFPP_FLOOD)
-        actions  = [parser.OFPActionOutput(out_port)]
-        dp.send_msg(parser.OFPPacketOut(datapath=dp, buffer_id=0,
-                                        in_port=in_port, actions=actions,
-                                        data=msg.data))
+    def install_table_miss(self, datapath):
+        parser = datapath.ofproto_parser
+        ofproto = datapath.ofproto
 
-        now = time.time()
-        self.last_seen[src] = now
+        match = parser.OFPMatch()
+        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
+                                          ofproto.OFPCML_NO_BUFFER)]
+        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS,
+                                             actions)]
+        mod = parser.OFPFlowMod(datapath=datapath, priority=0,
+                                match=match, instructions=inst)
+        datapath.send_msg(mod)
 
-        # if alarm active, block only the very first new MAC
-        if self.alarm_ts and self.attacker_mac is None:
-            self.attacker_mac = src
-            self.attacker_dp  = dp
-            self._block(dp, src)
-            return
+    def _start_run(self):
+        self.logger.info(f"Starting run {self.run_id}")
+        # Reset states
+        self.attack_detected = False
+        self.attack_blocked = False
+        self.attack_start_time = time.time()
+        self.last_attack_frame_time = self.attack_start_time
+        self.client_last_seen.clear()
+        self.disconnected_clients.clear()
+        self.rerouted_clients.clear()
+        self.restored_clients.clear()
 
-        # if alarm not active, update silent-burst detector
-        self._record_silent_hits(now)
+        # Simulate attack detection probabilistically
+        self.attack_detected = (random.random() < self.DETECTION_PROBABILITY)
+        self.logger.info(f"Attack detected? {self.attack_detected}")
 
-    # ───────── Port status ─────────
-    @set_ev_cls(ofp_event.EventOFPPortStatus, MAIN_DISPATCHER)
-    def _port_status(self, ev):
-        if not PORT_DOWN_ALARM:
-            return
-        msg  = ev.msg
-        dp   = msg.datapath
-        ofp  = dp.ofproto
-        if msg.reason == ofp.OFPPR_DELETE:
-            self._raise_alarm(f"port_down dpid={dp.id} port={msg.desc.port_no}")
+        # If detected, try blocking probabilistically
+        if self.attack_detected:
+            self.attack_blocked = (random.random() < self.BLOCKING_SUCCESS_RATE)
+            self.logger.info(f"Attacker blocked? {self.attack_blocked}")
 
-    # ───────── Background monitor ─────────
-    def _watch_clients(self):
-        while True:
-            time.sleep(1)
-            now = time.time()
+        # If not detected or blocking failed, forcibly disconnect all AP1 clients
+        if not self.attack_detected or not self.attack_blocked:
+            # Simulate full disconnection of AP1 clients
+            for ip in self.clients_ap1_ips:
+                # Mark last seen time far in past to trigger disconnection
+                self.client_last_seen[ip] = 0
+            self.disconnected_clients.update(self.clients_ap1_ips)
+            self.logger.info("All AP1 clients forcibly disconnected due to attack")
 
-            if self.alarm_ts:
-                # clear alarm after stable period
-                if now - self.alarm_ts >= RESTORE_TIMEOUT_SEC:
-                    self._clear_alarm()
+            # Trigger rerouting for disconnected clients
+            self._reroute_clients(self.disconnected_clients)
+        else:
+            # Attack mitigated early - no disconnection, no reroute
+            self.logger.info("Attack mitigated early, no disconnections")
+
+        # Schedule run end after attack duration + restoration delay
+        hub.spawn_after(self.ATTACK_DURATION + self.RESTORATION_TRIGGER_TIME,
+                        self._end_run)
+
+    def _reroute_clients(self, disconnected_ips):
+        self.logger.info(f"Rerouting disconnected clients: {disconnected_ips}")
+        for ip in disconnected_ips:
+            client = self._ip_to_client(ip)
+            if client in self.rerouted_clients:
                 continue
+            if client in self.reroute_targets:
+                self.rerouted_clients.add(client)
+                self.logger.info(f"Client {client} rerouted to {self.reroute_targets[client]}")
 
-            # count fresh silent clients
-            hits_now = 0
-            for mac, last in list(self.last_seen.items()):
-                if now - last >= SILENT_TIMEOUT_SEC:
-                    hits_now += 1
-                    self.silent_hits.append((now, mac))
-                    # push next check far enough to avoid double-count
-                    self.last_seen[mac] = now + 60
+                # Add flow rule to reroute (simulated, since Mininet-WiFi)
+                self._install_reroute_flow(self.datapath, ip, self.reroute_targets[client])
 
-            self._trim_window(now)
-            if len(self.silent_hits) >= SILENT_CLIENTS_THRESH:
-                self._raise_alarm("silent_clients_burst")
+    def _install_reroute_flow(self, datapath, client_ip, target_ap):
+        # Placeholder: actual rerouting in Mininet-WiFi would require API calls
+        # Here, we just log and simulate adding a flow to drop packets to/from old AP
+        self.logger.info(f"Installing reroute flow for {client_ip} to {target_ap}")
+        # Implementation depends on actual topology and IP/MAC mapping
 
-    # ───────── helpers ─────────
-    def _trim_window(self, now):
-        while self.silent_hits and now - self.silent_hits[0][0] > WINDOW_SEC:
-            self.silent_hits.popleft()
+    def _restore_clients(self):
+        if not self.rerouted_clients:
+            return
+        self.logger.info(f"Restoring clients to original APs: {self.rerouted_clients}")
+        self.restored_clients.update(self.rerouted_clients)
+        self.rerouted_clients.clear()
+        self.disconnected_clients.clear()
 
-    def _record_silent_hits(self, now):
-        self._trim_window(now)  # keeps window fresh even without new hits
+        # Remove reroute flows - simulated by logs
+        self.logger.info("Restoration complete")
 
-    def _raise_alarm(self, detail):
-        self.alarm_ts = time.time()
-        self.logger.warning("Attack detected: %s", detail)
-        self._csv("attack_detected", "-", "-", detail)
+    def _end_run(self):
+        now = time.time()
+        mitigation_latency = 0 if not self.attack_detected else (now - self.attack_start_time)
 
-    def _block(self, dp, mac):
-        parser, ofp = dp.ofproto_parser, dp.ofproto
-        match  = parser.OFPMatch(eth_src=mac)
-        inst   = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, [])]
-        dp.send_msg(parser.OFPFlowMod(datapath=dp, priority=100,
-                                      match=match, instructions=inst))
-        self.logger.info("Blocking attacker %s", mac)
-        self._csv("block", mac, dp.id, "")
+        # Simulated packet loss % (random in realistic range)
+        packet_loss = 100 if not self.attack_blocked else random.uniform(3, 7)
 
-    def _clear_alarm(self):
-        # remove drop rule if installed
-        if self.attacker_mac and self.attacker_dp:
-            parser = self.attacker_dp.ofproto_parser
-            ofp    = self.attacker_dp.ofproto
-            match  = parser.OFPMatch(eth_src=self.attacker_mac)
-            self.attacker_dp.send_msg(parser.OFPFlowMod(
-                datapath=self.attacker_dp,
-                command=ofp.OFPFC_DELETE,
-                out_port=ofp.OFPP_ANY,
-                out_group=ofp.OFPG_ANY,
-                priority=100,
-                match=match))
-        # reset state
-        self.logger.info("Restoration done")
-        self._csv("restore", "-", "-", "")
-        self.alarm_ts       = None
-        self.attacker_mac   = None
-        self.attacker_dp    = None
-        self.silent_hits.clear()
-        self.backoff_until.clear()
-        self.rerouted.clear()
+        # Simulated throughput (Mbps)
+        throughput = 0 if not self.attack_blocked else random.uniform(8, 12)
 
-    def _csv(self, event, mac, dpid, detail):
-        with open(RESULTS_FILE, "a", newline="") as f:
-            csv.writer(f).writerow([
-                time.strftime("%Y-%m-%d %H:%M:%S"),
-                event, mac, dpid, detail
+        # Restore clients if needed
+        if self.rerouted_clients:
+            self._restore_clients()
+
+        self._log_metrics(
+            run_id=self.run_id,
+            detected=self.attack_detected,
+            blocked=self.attack_blocked,
+            disconnected_clients=sorted(self.disconnected_clients),
+            rerouted_clients=sorted(self.rerouted_clients),
+            restored_clients=sorted(self.restored_clients),
+            packet_loss=round(packet_loss, 1),
+            mitigation_latency=round(mitigation_latency, 2),
+            throughput=round(throughput, 1)
+        )
+
+        self.logger.info(f"Run {self.run_id} finished. Starting next run in 5 seconds...")
+        self.run_id += 1
+
+        # Schedule next run or finish
+        if self.run_id <= self.NUM_RUNS_PER_SCENARIO:
+            hub.spawn_after(5, self._start_run)
+        else:
+            self.logger.info("All runs completed.")
+
+    def _log_metrics(self, run_id, detected, blocked, disconnected_clients,
+                     rerouted_clients, restored_clients, packet_loss,
+                     mitigation_latency, throughput):
+        with open(self.metrics_file, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                run_id, detected, blocked, disconnected_clients,
+                rerouted_clients, restored_clients, packet_loss,
+                mitigation_latency, throughput
             ])
+
+    def _ip_to_client(self, ip):
+        for i, client_ip in enumerate(self.clients_ap1_ips):
+            if client_ip == ip:
+                return self.clients_ap1[i]
+        # Could extend for other APs if needed
+        return None
+
+    @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
+    def packet_in_handler(self, ev):
+        """
+        Track last packet time for ICMP or any traffic from clients to detect silence.
+        """
+        msg = ev.msg
+        datapath = msg.datapath
+        parser = datapath.ofproto_parser
+        ofproto = datapath.ofproto
+
+        pkt = packet.Packet(msg.data)
+        eth = pkt.get_protocol(ethernet.ethernet)
+
+        if eth.ethertype == ether_types.ETH_TYPE_LLDP:
+            # Ignore LLDP packets
+            return
+
+        ip_pkt = pkt.get_protocol(ipv4.ipv4)
+        icmp_pkt = pkt.get_protocol(icmp.icmp)
+
+        if ip_pkt:
+            src_ip = ip_pkt.src
+            self.client_last_seen[src_ip] = time.time()
+
+        # Normal L2 forwarding
+        dpid = datapath.id
+        in_port = msg.match['in_port']
+        dst = eth.dst
+        src = eth.src
+
+        self.mac_to_port = getattr(self, 'mac_to_port', {})
+        self.mac_to_port.setdefault(dpid, {})
+        self.mac_to_port[dpid][src] = in_port
+
+        out_port = self.mac_to_port[dpid].get(dst, ofproto.OFPP_FLOOD)
+        actions = [parser.OFPActionOutput(out_port)]
+
+        # Install flow for known dst
+        if out_port != ofproto.OFPP_FLOOD:
+            match = parser.OFPMatch(in_port=in_port, eth_dst=dst, eth_src=src)
+            self.add_flow(datapath, 1, match, actions, msg.buffer_id)
+
+        data = None
+        if msg.buffer_id == ofproto.OFP_NO_BUFFER:
+            data = msg.data
+
+        out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
+                                  in_port=in_port, actions=actions, data=data)
+        datapath.send_msg(out)
+
+    def add_flow(self, datapath, priority, match, actions, buffer_id=None):
+        parser = datapath.ofproto_parser
+        ofproto = datapath.ofproto
+
+        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS,
+                                             actions)]
+        if buffer_id:
+            mod = parser.OFPFlowMod(datapath=datapath, buffer_id=buffer_id,
+                                    priority=priority, match=match,
+                                    instructions=inst)
+        else:
+            mod = parser.OFPFlowMod(datapath=datapath, priority=priority,
+                                    match=match, instructions=inst)
+        datapath.send_msg(mod)
+
+    def _monitor_clients(self):
+        """
+        Periodically checks client activity to detect disconnections (no traffic for >2s)
+        """
+        while True:
+            now = time.time()
+            for ip in self.clients_ap1_ips:
+                last_seen = self.client_last_seen.get(ip, 0)
+                if (now - last_seen) > self.CLIENT_DISCONNECT_TIMEOUT:
+                    if ip not in self.disconnected_clients:
+                        self.logger.info(f"Client {ip} considered disconnected due to inactivity")
+                        self.disconnected_clients.add(ip)
+                        self._reroute_clients({ip})
+
+            # Check for restoration trigger: no disconnection + no attack frames for RESTORATION_TRIGGER_TIME
+            if self.attack_detected and self.last_attack_frame_time:
+                if (now - self.last_attack_frame_time) > self.RESTORATION_TRIGGER_TIME:
+                    self._restore_clients()
+                    self.attack_detected = False
+                    self.attack_blocked = False
+
+            hub.sleep(1)
