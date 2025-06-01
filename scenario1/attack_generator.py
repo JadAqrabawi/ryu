@@ -12,7 +12,7 @@ from scapy.all import Ether, IP, ICMP, sendp
 victim_ips = ['10.0.1.1', '10.0.1.2', '10.0.1.3', '10.0.1.4']
 
 attacker_mac = "00:11:22:33:44:55"
-attacker_ip = "192.168.0.100"
+attacker_ip = "10.0.1.100"
 
 fps = 50
 duration = 30
