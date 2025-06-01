@@ -15,10 +15,8 @@ from mn_wifi.wmediumdConnector import interference
 setLogLevel('info')
 
 # results folder
-RESULTS_DIR = os.getenv("SDN_RESULTS_DIR",
-                        "/home/ryu/sdn/scenario1/results")
-os.makedirs(RESULTS_DIR, exist_ok=True)
-RUN_LOG = f"{RESULTS_DIR}/scenario1_runs.csv"
+RESULTS_DIR = os.path.dirname(os.path.abspath(__file__))
+RUN_LOG = os.path.join(RESULTS_DIR, "scenario1_runs.csv")
 
 def record(row: dict):
     hdr = not os.path.exists(RUN_LOG)
