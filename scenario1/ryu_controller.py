@@ -17,9 +17,10 @@ from ryu.ofproto import ofproto_v1_3
 
 
 # ───────── Paths ─────────
-RESULTS_DIR  = os.getenv("SDN_RESULTS_DIR",
-                         "/home/ethical/sdn_project/scenario1/results")
-RESULTS_FILE = f"{RESULTS_DIR}/scenario1_sdn.csv"
+DEFAULT_RESULTS_DIR = os.path.expanduser("~/results")
+RESULTS_DIR  = os.getenv("SDN_RESULTS_DIR", DEFAULT_RESULTS_DIR)
+os.makedirs(RESULTS_DIR, exist_ok=True)
+RESULTS_FILE = os.path.join(RESULTS_DIR, "scenario1_sdn.csv")
 
 # ───────── Detection thresholds ─────────
 PORT_DOWN_ALARM        = True          # raise alarm on AP port down
@@ -50,7 +51,6 @@ class MitigationController(app_manager.RyuApp):
         self.attacker_dp   = None         # datapath holding the drop rule
 
         # CSV preparation
-        os.makedirs(RESULTS_DIR, exist_ok=True)
         if not os.path.exists(RESULTS_FILE):
             with open(RESULTS_FILE, "w", newline="") as f:
                 csv.writer(f).writerow(

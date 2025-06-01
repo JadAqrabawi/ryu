@@ -16,7 +16,7 @@ setLogLevel('info')
 
 # results folder
 RESULTS_DIR = os.getenv("SDN_RESULTS_DIR",
-                        "/home/ethical/sdn_project/scenario1/results")
+                        "/home/ryu/sdn/scenario1/results")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 RUN_LOG = f"{RESULTS_DIR}/scenario1_runs.csv"
 
@@ -82,11 +82,17 @@ def start_pings(stations, dst="10.0.0.254"):
 def outage(net, ap2):
     info("*** waiting 30 s – then bring ap2-s1 link DOWN for 20 s\n")
     time.sleep(30)
-    net.configLinkStatus(ap2, "s1", "down")
-    info("*** link down\n")
+    if ap2.name in net.nameToNode:
+        net.configLinkStatus(ap2, "s1", "down")
+        info("*** link down\n")
+    else:
+        info("*** ap2 not found in net\n")
     time.sleep(20)
-    net.configLinkStatus(ap2, "s1", "up")
-    info("*** link restored\n")
+    if ap2.name in net.nameToNode:
+        net.configLinkStatus(ap2, "s1", "up")
+        info("*** link restored\n")
+    else:
+        info("*** ap2 not found in net\n")
 
 # main
 def run():
