@@ -112,8 +112,9 @@ class DeauthDefense(app_manager.RyuApp):
                     self.ping_results.setdefault(src_ip, {'sent': 0, 'received': 0})
                     self.ping_results[src_ip]['sent'] += 1
                 elif icmp_pkt.type == icmp.ICMP_ECHO_REPLY:
-                    self.ping_results.setdefault(src_ip, {'sent': 0, 'received': 0})
-                    self.ping_results[src_ip]['received'] += 1
+                    dst_ip = ip_pkt.dst
+                    if dst_ip in self.ping_results:
+                        self.ping_results[dst_ip]['received'] += 1
 
     def _detection_trigger(self):
         hub.sleep(self.ATTACK_START_DELAY)
@@ -232,28 +233,34 @@ class DeauthDefense(app_manager.RyuApp):
             self.logger.info(f"Removed reroute flow for client {client_ip}")
 
     def _log_results(self):
-        # Calculate metrics based on actual ping results
+        # Calculate real packet loss for attacked clients
         total_sent = 0
         total_received = 0
+        attacked_clients = ['10.0.1.1', '10.0.1.2', '10.0.1.3', '10.0.1.4']
         
-        # Only consider clients in the attack subnet
-        attack_subnet_clients = self.AP_PORTS[self.ATTACKED_AP_ID]['reroute_ports'].keys()
+        for client in attacked_clients:
+            if client in self.ping_results:
+                total_sent += self.ping_results[client].get('sent', 0)
+                total_received += self.ping_results[client].get('received', 0)
         
-        for client_ip in attack_subnet_clients:
-            if client_ip in self.ping_results:
-                total_sent += self.ping_results[client_ip].get('sent', 0)
-                total_received += self.ping_results[client_ip].get('received', 0)
-        
-        # Calculate packet loss
+        # Calculate packet loss percentage
         if total_sent > 0:
             self.packet_loss_pct = 100.0 * (1 - total_received / total_sent)
         else:
             self.packet_loss_pct = 100.0
         
-        # Estimate throughput based on packet activity
-        active_clients = len([ip for ip in attack_subnet_clients 
-                             if ip in self.ping_results and self.ping_results[ip].get('received', 0) > 0])
-        self.throughput_mbps = active_clients * 1.5  # 1.5 Mbps per active client
+        # Calculate throughput based on received packets
+        duration = 30  # Assuming 30-second test duration
+        if duration > 0:
+            total_bytes = sum([stats.get('received', 0)*64 for stats in self.ping_results.values()])
+            self.throughput_mbps = (total_bytes * 8) / (duration * 1e6)
+        else:
+            self.throughput_mbps = 0.0
+        
+        # Format client lists for CSV
+        disconnected_str = str(sorted(self.disconnected_clients))
+        rerouted_str = str(sorted(self.rerouted_clients))
+        restored_str = str(sorted(self.restored_clients))
         
         # Write results to CSV
         with open(self.csv_file, 'a', newline='') as f:
@@ -262,9 +269,9 @@ class DeauthDefense(app_manager.RyuApp):
                 self.run_id,
                 self.attack_detected,
                 self.attack_blocked,
-                list(self.disconnected_clients),
-                list(self.rerouted_clients),
-                list(self.restored_clients),
+                disconnected_str,
+                rerouted_str,
+                restored_str,
                 round(self.mitigation_latency, 2),
                 round(self.packet_loss_pct, 2),
                 round(self.throughput_mbps, 2)
